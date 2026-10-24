@@ -20,7 +20,8 @@ namespace {
 // one-time clean re-parse that re-composes existing caches' titles to NFC.
 // v11: ignore ambiguous guide text references. Upstream shipped that behavior
 // as v10, so CrossMux advances past both lineages to avoid a version collision.
-constexpr uint8_t BOOK_CACHE_VERSION = 11;
+// v12: retain the OPF linear flag; auxiliary documents have zero progress weight.
+constexpr uint8_t BOOK_CACHE_VERSION = 12;
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -37,6 +38,7 @@ uint32_t writeSpineEntryTo(F& file, const BookMetadataCache::SpineEntry& entry) 
   serialization::writeString(file, entry.href);
   serialization::writePod(file, entry.cumulativeSize);
   serialization::writePod(file, entry.tocIndex);
+  serialization::writePod(file, static_cast<uint8_t>(entry.linear));
   return pos;
 }
 
@@ -54,26 +56,35 @@ uint32_t writeTocEntryTo(F& file, const BookMetadataCache::TocEntry& entry) {
 template <typename F>
 bool readSpineEntryFrom(F& file, BookMetadataCache::SpineEntry& entry) {
   BookMetadataCache::SpineEntry next;
+  uint8_t linear = 0;
   if (!serialization::readString(file, next.href, serialization::MAX_PATH_BYTES) ||
-      !serialization::readPod(file, next.cumulativeSize) || !serialization::readPod(file, next.tocIndex)) {
+      !serialization::readPod(file, next.cumulativeSize) || !serialization::readPod(file, next.tocIndex) ||
+      !serialization::readPod(file, linear) || linear > 1) {
     return false;
   }
+  next.linear = linear != 0;
   entry = std::move(next);
   return true;
 }
 
-bool readSpineCumulativeSize(HalFile& file, uint32_t& cumulativeSize) {
+bool readSpineCumulativeSize(HalFile& file, uint32_t& cumulativeSize, bool& linear) {
   uint32_t hrefLength = 0;
   if (!serialization::readPod(file, hrefLength)) return false;
   const size_t position = file.position();
   const size_t fileSize = file.size();
-  constexpr size_t trailingBytes = sizeof(uint32_t) + sizeof(int16_t);
+  constexpr size_t trailingBytes = sizeof(uint32_t) + sizeof(int16_t) + sizeof(uint8_t);
   if (position > fileSize || hrefLength > fileSize - position || trailingBytes > fileSize - position - hrefLength ||
       !file.seek(position + hrefLength)) {
     return false;
   }
   int16_t tocIndex = -1;
-  return serialization::readPod(file, cumulativeSize) && serialization::readPod(file, tocIndex);
+  uint8_t flag = 0;
+  if (!serialization::readPod(file, cumulativeSize) || !serialization::readPod(file, tocIndex) ||
+      !serialization::readPod(file, flag) || flag > 1) {
+    return false;
+  }
+  linear = flag != 0;
+  return true;
 }
 
 template <typename F>
@@ -308,8 +319,8 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     // NOTE: We intentionally skip calling loadAllFileStatSlims() here.
     // For large EPUBs (2000+ chapters), pre-loading all ZIP central directory entries
     // into memory causes OOM crashes on ESP32-C3's limited ~380KB RAM.
-    // Instead, for large books we use a one-pass batch lookup that scans the ZIP
-    // central directory once and matches against spine targets using hash comparison.
+    // Instead, for large books we use a batch lookup that scans the ZIP central
+    // directory once per chunk and matches against spine targets using hash comparison.
     // This is O(n*log(m)) instead of O(n*m) while avoiding memory exhaustion.
     // See: https://github.com/crosspoint-reader/crosspoint-reader/issues/134
 
@@ -317,7 +328,8 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       LOG_DBG("BMC", "Using batch size lookup for %d spine items", spineCount);
 
       std::deque<ZipFile::SizeTarget> targets;
-      targets.resize(spineCount);
+      spineSizes.emplace(spineCount, 0);
+      int matched = 0;
 
       spineIn.seek(0);
       for (int i = 0; i < spineCount; i++) {
@@ -329,15 +341,16 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
         t.hash = ZipFile::fnvHash64(path.c_str(), path.size());
         t.len = static_cast<uint16_t>(path.size());
         t.index = static_cast<uint16_t>(i);
-        targets[i] = t;
+        targets.push_back(t);
+        // Targets take 16 B per spine item, so look sizes up 2,048 items at a time.
+        if (targets.size() < 2048 && i + 1 < spineCount) continue;
+
+        std::sort(targets.begin(), targets.end(), [](const ZipFile::SizeTarget& a, const ZipFile::SizeTarget& b) {
+          return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
+        });
+        matched += zip.fillUncompressedSizes(targets, *spineSizes);
+        targets.clear();
       }
-
-      std::sort(targets.begin(), targets.end(), [](const ZipFile::SizeTarget& a, const ZipFile::SizeTarget& b) {
-        return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
-      });
-
-      spineSizes.emplace(spineCount, 0);
-      int matched = zip.fillUncompressedSizes(targets, *spineSizes);
       LOG_DBG("BMC", "Batch lookup matched %d/%d spine items", matched, spineCount);
     }
   } else {
@@ -377,7 +390,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       }
     }
 
-    cumSize += itemSize;
+    if (spineEntry.linear) cumSize += itemSize;
     spineEntry.cumulativeSize = cumSize;
     writeSpineEntryTo(bookOut, spineEntry);
   }
@@ -433,13 +446,13 @@ uint32_t BookMetadataCache::writeTocEntry(HalFile& file, const TocEntry& entry) 
 
 // Note: for the LUT to be accurate, this **MUST** be called for all spine items before `addTocEntry` is ever called
 // this is because in this function we're marking positions of the items
-void BookMetadataCache::createSpineEntry(const std::string& href) {
+void BookMetadataCache::createSpineEntry(const std::string& href, const bool linear) {
   if (!buildMode || !spineFile) {
     LOG_DBG("BMC", "createSpineEntry called but not in build mode");
     return;
   }
 
-  const SpineEntry entry(href, 0, -1);
+  const SpineEntry entry(href, 0, -1, linear);
   if (passOut) {
     writeSpineEntryTo(*passOut, entry);
   } else {
@@ -559,19 +572,25 @@ bool BookMetadataCache::load() {
   std::unique_ptr<uint32_t[]> nextCumulativeSizes;
   uint16_t nextCumulativeSizeCount = 0;
   if (nextSpineCount > 0 && nextSpineCount <= MAX_CUMULATIVE_SIZE_CACHE_ITEMS) {
-    auto sizes = makeUniqueNoThrow<uint32_t[]>(nextSpineCount);
+    // Reuse the size-cache allocation for one linear bit per spine, avoiding
+    // strings and SD seeks in chapter navigation without another heap block.
+    const size_t flagWords = (nextSpineCount + 31U) / 32U;
+    auto sizes = makeUniqueNoThrow<uint32_t[]>(nextSpineCount + flagWords);
     if (sizes) {
+      std::fill(sizes.get() + nextSpineCount, sizes.get() + nextSpineCount + flagWords, 0);
       if (!bookFile.seek(nextLutOffset + lutSize)) {
         LOG_ERR("BMC", "Could not seek to cache spine data");
         invalidateCorruptCache();
         return false;
       }
       for (uint16_t i = 0; i < nextSpineCount; i++) {
-        if (!readSpineCumulativeSize(bookFile, sizes[i])) {
+        bool linear = true;
+        if (!readSpineCumulativeSize(bookFile, sizes[i], linear)) {
           LOG_ERR("BMC", "Cache spine entry %u is truncated", i);
           invalidateCorruptCache();
           return false;
         }
+        if (linear) sizes[nextSpineCount + i / 32U] |= uint32_t{1} << (i % 32U);
       }
       nextCumulativeSizeCount = nextSpineCount;
       nextCumulativeSizes = std::move(sizes);
@@ -594,6 +613,12 @@ bool BookMetadataCache::load() {
 bool BookMetadataCache::getCumulativeSize(const int index, uint32_t& size) const {
   if (!cumulativeSizes || index < 0 || index >= cumulativeSizeCount) return false;
   size = cumulativeSizes[index];
+  return true;
+}
+
+bool BookMetadataCache::getLinear(const int index, bool& linear) const {
+  if (!cumulativeSizes || index < 0 || index >= cumulativeSizeCount) return false;
+  linear = (cumulativeSizes[cumulativeSizeCount + index / 32U] & (uint32_t{1} << (index % 32U))) != 0;
   return true;
 }
 

@@ -11,7 +11,7 @@ bytes invalidates the cache; the output value is left unchanged.
 
 ## `book.bin`
 
-### Version 11
+### Version 12
 
 `book.bin` stores EPUB metadata plus lookup tables for spine and TOC entries.
 The current firmware writes this version from `BookMetadataCache`.
@@ -20,6 +20,8 @@ The current firmware writes this version from `BookMetadataCache`.
 > Upstream version 10 ignores ambiguous EPUB guide text references. CrossMux uses
 > 11 to include both changes while remaining above every shipped value from
 > either lineage. `BookMetadataCache.cpp` is the source of truth.
+> Version 12 adds the spine `linear` flag. Non-linear resources remain reachable
+> by links but do not contribute to sequential navigation or book progress.
 
 ImHex pattern:
 
@@ -28,7 +30,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 11
+#define EXPECTED_VERSION 12
 #define MAX_STRING_LENGTH 65535
 
 struct String {
@@ -53,8 +55,9 @@ struct Metadata {
 
 struct SpineEntry {
     String href [[comment("Resource path")]];
-    u32 cumulativeSize [[comment("Cumulative uncompressed spine size through this entry")]];
+    u32 cumulativeSize [[comment("Cumulative uncompressed linear spine size through this entry")]];
     s16 tocIndex [[comment("Index into TOC, or inherited/previous TOC index when no direct entry exists")]];
+    u8 linear [[comment("0: auxiliary resource; 1: default reading order")]];
 };
 
 struct TocEntry {
@@ -99,6 +102,47 @@ if (parsedSize != fileSize) {
 ```
 
 ## `section.bin`
+
+### Versions 82 / 83
+
+Adds a one-byte `bool verticalBottomAlign` immediately after
+`paragraphAlignment` in the 47-byte section header. Complete versions are
+82 (Latin) / 83 (CJK); partial sentinels are 200 / 199, derived with
+`0xFE - (completeVersion - 28)`. Early PR builds used overlapping 79/80
+versions, so the final format skips 80/81 to avoid accepting their layouts.
+
+The option redistributes spare height between lines on non-final text pages,
+with a half-line-height cap per gap. Grid-table, image and rule pages retain
+fixed geometry; the final chapter page stays top-aligned. Links move with their
+text lines. Both section-cache identity and clipping layout signatures include
+the toggle. Complete and partial layouts rebuild on an option/version change;
+book metadata and source-offset reading/clipping anchors remain available.
+
+### Versions 78 / 79
+
+Unified firmware uses version **79**; the Latin counter is **78**. Partial
+versions are **203 / 204** respectively, derived as
+`0xFE - (completeVersion - 28)`. `book.bin` stays at version **11** and per-book
+[`BookKey`](../lib/Epub/BookKey.h) AES-128 payloads stay **16 bytes**; neither
+unchanged layout needs a new counter.
+
+Each TextBlock writes `numWords` (uint16), `hasFocus` (uint8), `textBytes`
+(uint16), and then the new `paragraphStartWord` (uint16). The latter is the visual
+index of the paragraph's first logical word; `UINT16_MAX` means a continuation
+line. The arena begins with one source range per word: two uint32 chapter-visible
+Unicode-codepoint offsets, `[start, end)`, with `UINT32_MAX` for unavailable
+positions. Ranges follow words through BiDi ordering and wrapping, including
+codepoints absorbed by NFC composition. Existing text-offset/x-position/focus/
+style/text arrays follow. Style bit `0x80` marks a discretionary hyphen and is
+masked before interpreting the glyph style, so clipping removes it independently
+of source length.
+
+These versions incorporate upstream section versions 52–55, including font-sized
+solid rectangles for missing U+2588/U+25A0 redaction symbols. Rebuild complete and
+partial pagination so the new widths, positions, paragraph markers and clipping
+anchors agree. Retain metadata, source-offset progress, ruby fields, and the local
+BlockStyle/header order. The existing hollow placeholder remains for other
+unsupported visible characters.
 
 ### Versions 76 / 77
 
@@ -237,8 +281,8 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define LATIN_VERSION 76
-#define CHINESE_VERSION 77
+#define LATIN_VERSION 82
+#define CHINESE_VERSION 83
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 256
@@ -298,24 +342,32 @@ struct BlockStyle {
     s8 characterSpacing;
 };
 
+struct SourceRange {
+    u32 start [[comment("Chapter codepoint offset; 0xFFFFFFFF if unknown")]];
+    u32 end [[comment("Exclusive chapter codepoint offset")]];
+};
+
 struct TextBlock {
     u16 wordCount;
     u8 hasFocus;
     u16 textBytes [[comment("Total size of text[], including one NUL per word")]];
+    u16 paragraphStartWord [[comment("Visual paragraph-start index, 0xFFFF for continuation")]];
 
     if (wordCount > 0) {
+        SourceRange sourceRanges[wordCount];
         u16 textOff[wordCount] [[comment("Byte offset of word i's text within text[]")]];
         s16 wordXPos[wordCount];
         if (hasFocus != 0) {
             u16 wordFocusSuffixX[wordCount] [[comment("Suffix x offset from word start")]];
         }
-        WordStyle wordStyle[wordCount];
+        u8 wordStyle[wordCount] [[comment("WordStyle flags; 0x80 marks a discretionary hyphen")]];
         if (hasFocus != 0) {
             u8 wordFocusBoundary[wordCount] [[comment("UTF-8 byte boundary between bold prefix and suffix")]];
         }
         char text[textBytes] [[comment("All words back to back, each NUL-terminated")]];
     }
 
+    String rubyTexts[wordCount] [[comment("One annotation per word, empty when absent")]];
     BlockStyle blockStyle;
 };
 
@@ -408,6 +460,7 @@ struct SectionBin {
     u8 firstLineIndent;
     u8 paragraphIndentSpaces; // forced Western indent, 0..5
     u8 paragraphAlignment;
+    bool verticalBottomAlign;
     u16 viewportWidth;
     u16 viewportHeight;
     bool hyphenationEnabled;
@@ -539,6 +592,8 @@ count as their decoded visible Unicode codepoint. Source offsets inside a multib
 character resolve to that character. Lookup binary-searches records on disk. The inverse lookup searches visible
 offsets, then resolves the source position through `chapters.bin` for the current
 TOC title and chapter navigation, without retaining chapter tables.
+Chapter lookup treats visible offset 0 (the generated leading body newline) as
+position 1, the first source-mapped visible position, including any dropped BOM.
 Maps publish from `.tmp` only after successful conversion and flush. Books at or
 above 4GiB and chapter counts exceeding the existing 16-bit TOC budget fail safely.
 
@@ -580,7 +635,7 @@ location is not migrated or read.
   indexes start with a 12-byte little-endian header:
   `uint32 magic`, `uint16 version`, `uint16 recordSize`, `uint32 recordCount`.
   Their magic values are `WRS6` (`0x36535257`) and `WRT2` (`0x32545257`);
-  image indexes use `WRI2` (`0x32495257`) and image work indexes use `WIP1`
+  image indexes use `WRI4` (`0x34495257`) and image work indexes use `WIP1`
   (`0x31504957`). Version is currently `1`.
 - Shelf records contain fixed `bookId[64]`, `title[192]`, `author[96]`, and
   validated HTTPS `coverUrl[512]` fields followed by `uint32 readUpdateTime`.
@@ -588,21 +643,21 @@ location is not migrated or read.
   bytes must identify as JPEG/PNG. TOC records contain fixed
   `chapterUid[64]`, `title[192]`, `uint32 wordCount`,
   `uint32 chapterIdx`, and a paid flag.
-- `WRI2` records contain a generated EPUB-relative `href[64]` and the original
+- `WRI4` records contain a generated EPUB-relative `href[64]` and the original
   HTTPS image URL in `url[512]`; both are NUL-terminated. TXT chapters have a
   valid zero-record index. Images that pass download and JPEG/PNG validation
   are stored below `<bookId>/images/` and embedded into the generated EPUB.
-- `WIP1` records contain one `WRI2` record followed by `uint8 state`,
+- `WIP1` records contain one `WRI4` record followed by `uint8 state`,
   `uint8 attempts`, `uint8 redirects`, and one reserved byte. They schedule
   pending images by HTTPS host so one TLS connection can serve a host batch.
   During an `Embed` download, completed records are also the authoritative
   image list for the OPF manifest and ZIP packaging pass.
-  `images.work` is always rebuilt from `WRI2`, may be deleted after interruption,
+  `images.work` is always rebuilt from `WRI4`, may be deleted after interruption,
   and is removed when the job finishes; it is not a durable cache format.
 - Per-book `options.bin` is an atomic fixed 8-byte `WRO1` record:
   `uint32 magic` (`0x314F5257`), `uint16 version` (`1`), `uint8 imagePolicy`,
   and one zero reserved byte. Policy `0` embeds validated images and policy `1`
-  excludes image requests and EPUB image entries while retaining `WRI2` and
+  excludes image requests and EPUB image entries while retaining `WRI4` and
   existing image files. Missing, truncated, unknown-policy, or otherwise
   damaged records fall back to policy `0`. The record is replaced only after a
   generated EPUB succeeds; a directly returned complete EPUB remains unchanged.
@@ -694,10 +749,31 @@ rejected `WRS4` shelves because shelf records added `readUpdateTime`; records
 are rewritten in descending timestamp order while preserving server order for
 ties. `WRS4` rejected `WRS3` shelves whose book
 titles could be overwritten by nested category titles. A cached chapter
-without a valid `WRI2` index is downloaded again so pre-image-support chapter
-caches cannot silently lose figures. `WRI2` also rejects chapters generated
-before unsupported footnote references and bodies were filtered. Existing
-`/WeRead/*.epub` files remain readable and are not upgraded automatically;
+without a valid `WRI4` index is downloaded again so pre-image-support chapter
+caches cannot silently lose figures. `WRI2` rejected chapters generated
+before unsupported footnote references and bodies were filtered. `WRI3` also
+rejects `WRI2` chapters that could render `qqreader-footnote` image `alt` text
+inline. `WRI4` rejects earlier generated chapters because `qqreader-footnote`
+images now become EPUB 3 noterefs with complete text in a separate notes
+resource. Both HTML `<img>` and XHTML `<img/>` forms are supported, independently
+of the image download policy. Other unsupported annotation types remain filtered.
+
+Each chapter has `chapters/NNNNNN.notes.xhtml`: zero bytes means no notes;
+otherwise it is a complete UTF-8 XHTML document. A reusable chapter requires its
+body, notes sidecar and valid `WRI4` index. Conversion publishes the notes and
+body before the image index, which is the chapter completion marker. Notes are
+streamed from the decoded source with the existing bounded buffers, including
+attributes larger than the 4096-byte tag buffer; there is no fixed note-length
+cap beyond SD/file and existing UTF-16 offset limits.
+Conversion checks cancellation between input and look-back chunks; cancellation
+removes temporary files without replacing the existing EPUB.
+
+The EPUB includes nonempty sidecars as `OEBPS/notesNNNNNN.xhtml`, with linked
+`noteref`, `footnote` and `backlink` semantics. All body spine items precede notes
+items; notes use `linear="no"` and are omitted from the chapter TOC. Note numbering
+starts at one for each chapter. Empty or missing `alt` attributes produce no
+reference. The package includes its UTC `dcterms:modified` value.
+Existing `/WeRead/*.epub` files remain readable and are not upgraded automatically;
 cache a book again to rebuild affected chapters and embed its available cover
 and selected chapter images.
 
@@ -708,8 +784,10 @@ of WeRead's native `chapterOffset`.
 Newly generated chapter XHTML embeds `<!--wr-co:N-->` comments at source-text,
 entity, image, and final boundaries. `N` is the zero-based UTF-16 code-unit
 offset in the decoded raw chapter source after removing a UTF-8 BOM. The reader
-ignores these comments; manual sync streams the loose generated chapter to map
-between its visible-text offsets and WeRead's native offsets. Old chapters have
+ignores these comments; manual sync extracts the chapter from the EPUB being
+read to a temporary `weread-progress-map.part` in its reader-cache directory,
+maps visible-text offsets to WeRead's native offsets, then removes the temporary
+file. It never uses a possibly newer loose chapter left by an interrupted recache. Old chapters have
 no marker and remain compatible through the approximate fallback.
 Manual progress sync refreshes only an old or invalid TOC; an existing
 `/WeRead/*.epub` is retained.
@@ -882,3 +960,37 @@ make a real book disappear.
 
 `selfSize` is the expected file size. Comparing it against the real one is a free
 truncation guard: a build cut short by a power failure cannot pass.
+
+## Clipping store (`/.crosspoint/clippings/epub_<path-hash>.bin`)
+
+Version 4 retains the version 3 header and page-local range fields. After each
+record's layout signature it stores `startOffset` and `endOffset` (uint32 chapter
+codepoint range, end exclusive; UINT32_MAX means unavailable), `syncRevision`
+(uint64), `pendingUpload` (one byte), and a 65-byte NUL-terminated sync ID. The
+chapter title, text length, and text follow. Versions 1–3 remain readable.
+
+Stable IDs are saved before upload. A sibling `.deleted` file stores fixed
+65-byte IDs awaiting server acknowledgement. Deletions are queued before the
+local record is removed and retried on the next enabled manual sync. A `.bak`
+file is recovered if power interrupted replacement of the main store.
+
+Clipping header strings are limited to 4 KiB on both reads and writes. A failed
+load leaves no usable index and disables writes until a successful load. The
+index is allocated with checked, bounded growth and released on unload.
+
+Book moves rename the store and its `.deleted` journal (plus recovery sidecars)
+together. The stored source path is informational and is refreshed on the next
+save; the current file path selects the store. Local book deletion cleans up all
+of these sidecars but preserves the independent `My Clippings.txt` export.
+
+### Sleep-cover transaction
+
+`/sleep.bmp.txn` is a private version **1**, three-byte record: byte 0 is the
+version (`1`), byte 1 is the previous `SLEEP_SCREEN_MODE`, and byte 2 is `0` or
+`1` indicating whether a previous `/sleep.bmp` existed. It is written and closed
+before renaming the previous BMP to `/sleep.bmp.bak`. Its removal, after BMP
+validation and a successful settings save, commits the replacement. Recovery
+with a valid marker restores the old image/mode before clearing the marker;
+malformed markers and failed rollback preserve recovery files. Legacy `.bak`
+files without a marker remain recoverable. Existing font, book, paging and
+settings binary layouts are unchanged.

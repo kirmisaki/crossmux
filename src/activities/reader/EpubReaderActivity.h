@@ -12,6 +12,7 @@
 
 #include "BookmarkEntry.h"
 #include "ChapterPosition.h"
+#include "ClipSelectionActivity.h"
 #include "EpubReaderMenuActivity.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
@@ -36,6 +37,7 @@ class EpubReaderActivity final : public ReaderActivity {
   unsigned long pageTurnDuration = 0UL;
   uint8_t pageTurnRate = 15;
   int8_t pendingManualTurn = 0;
+  bool pendingManualTurnTouch = false;
   bool pendingPercentJump = false;
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
@@ -48,6 +50,9 @@ class EpubReaderActivity final : public ReaderActivity {
   bool showBookmarkMessage = false;
   bool showDictionaryMessage = false;
   unsigned long dictionaryMessageTime = 0UL;
+  bool showClippingMessage = false;
+  StrId clippingMessage = StrId::STR_CLIPPING_SAVED;
+  unsigned long clippingMessageTime = 0UL;
   bool currentPageBookmarked = false;
   int idlePrewarmSpine = -1;
   int idlePrewarmPage = -1;
@@ -135,6 +140,10 @@ class EpubReaderActivity final : public ReaderActivity {
   // overlay, letting panel->toolbar steps restore the page without a full
   // re-render. Discarded on close / whenever the page under the overlay changes.
   bool overlayPageStored = false;
+  // A background build step lent the framebuffer: it came back white while the panel still shows the
+  // page. Until renderBook() redraws, nothing may be painted straight onto it. Set by the loop task,
+  // cleared by the render task.
+  std::atomic<bool> pageBufferStale{false};
   // True while a deferred overlay chrome refresh (pushOverlayRefresh) may still
   // be running on the panel. settleOverlayRefresh() must run before the
   // framebuffer is touched or another differential refresh is pushed.
@@ -145,7 +154,8 @@ class EpubReaderActivity final : public ReaderActivity {
   // does NOT re-render the page: the overlay page snapshot was decoded with the
   // old filter, so it is dropped on close and the page re-decodes once there.
   bool imageScalingDirty = false;
-  int autoTurnOption = 0;  // current auto page-turn rate index (More panel)
+  int autoTurnOption = 0;                // auto page-turn option: 0=off, 1..3=rates[1..3], 4=custom
+  uint8_t customAutoPageTurnRate_ = 15;  // custom rate used when autoTurnOption == 4
   std::vector<EpubReaderMenuActivity::MenuItem> moreItems;
 
   // Footnote support
@@ -158,6 +168,7 @@ class EpubReaderActivity final : public ReaderActivity {
     int pageNumber;
     // Fixed-size return stack; offsets survive session CSS fallback without heap storage.
     std::optional<uint32_t> visibleTextOffset;
+    int pageCount = 0;
   };
   static constexpr int MAX_FOOTNOTE_DEPTH = 3;
   SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
@@ -166,6 +177,10 @@ class EpubReaderActivity final : public ReaderActivity {
   // still returns to where a followed link was tapped.
   void saveLinkStack() const;
   void loadLinkStack();
+  bool pushSavedPosition();
+  bool isViewingNonlinearSpine() const;
+  void leaveNonlinearSpine(int targetSpineIndex);
+  CrossPointPosition getReadingPosition() const;
 
   uint16_t buildViewportWidth = 0;
   uint16_t buildViewportHeight = 0;
@@ -186,6 +201,7 @@ class EpubReaderActivity final : public ReaderActivity {
   bool updateChapterBuild();
   bool stylesDisabledForSession_ = false;
   int renderedSpineIndex_ = -1;
+  int committedPageNumber_ = -1;
   int failedBuildSpine_ = -1;
   ReaderRenderSpec effectiveRenderSpec(uint16_t width, uint16_t height) const;
   bool handleBuildFailure(const char* stage, Section::BuildError error);
@@ -205,10 +221,24 @@ class EpubReaderActivity final : public ReaderActivity {
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   bool jumpToFraction(float fraction);
   void jumpToPercent(int percent);
+  bool handleZoneShortAction(const uint8_t action) override;
+  bool handleZoneLongAction(const uint8_t action) override;
+  void showAutoPageTurnPopup();
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
+  int currentTocIndex() const;
+  // Index of the chapter being read: the TOC index for TXT/MD (whose named
+  // chapters are anchors inside one spine) and the linear spine index otherwise.
+  int currentChapterIndex() const;
+  // Chapter navigation shared by the toolbar and the tap zones. TXT/MD books
+  // keep every named chapter in one spine, so a spine step would clamp back to
+  // the same offset and do nothing; this routes them through the TOC anchor
+  // instead. Returns whether the chapter actually changed, so a no-op tap can
+  // skip the repaint.
+  bool gotoChapterIndex(int target);
   // Live section position, or the values cached before a child screen
   // released the section.
   ChapterPosition chapterPosition() const;
+  float bookProgressFor(const ChapterPosition& position, bool includeCurrentPage = false) const;
   int bookPercentFor(const ChapterPosition& position) const;
   void openReaderMenu();
   // Toolbar reader menu (see Overlay above).
@@ -218,7 +248,6 @@ class EpubReaderActivity final : public ReaderActivity {
   void discardOverlayPage();
   void handleOverlayInput();
   void renderOverlay();
-  int currentTocIndex() const;
   std::string currentChapterTitle() const;
   // Text panel rows (font, size, line spacing, alignment, first-line indent).
   std::string textRowName(int row) const;
@@ -240,6 +269,12 @@ class EpubReaderActivity final : public ReaderActivity {
   void activateMoreRow(int row);
   void openFootnoteSelect(bool reopenMenuOnCancel);
   void openDictionaryWordSelect();
+  void startClipSelection(int initialX = -1, int initialY = -1,
+                          ClipSelectionActivity::Mode mode = ClipSelectionActivity::Mode::Clip);
+  int clippingAtPoint(const Page& page, int x, int y) const;
+  void invalidateClippingRender();
+  void openClippings();
+  void applyProgressChange(const ProgressChangeResult& progress);
   bool launchKOReaderSync();
 #ifdef ENABLE_CHINESE_VERSION
   bool launchWeReadSync();
@@ -253,8 +288,38 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
-  void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
+  bool renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
+  template <typename RenderPlane>
+  bool renderWholePlaneGrayscale(RenderPlane&& renderPlane) {
+    bool committed = false;
+    struct Restore {
+      GfxRenderer& renderer;
+      bool& committed;
+      ~Restore() {
+        renderer.setRenderMode(GfxRenderer::BW);
+        if (!committed) renderer.cancelGrayscale();
+        renderer.restoreBwBuffer(committed);
+      }
+    } restore{renderer, committed};
+    for (bool lsb : {true, false}) {
+      if (activityManager.isSwitchPending()) return false;
+      renderer.setRenderMode(lsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+      renderPlane(lsb);
+      if (activityManager.isSwitchPending()) return false;
+      if (lsb)
+        renderer.copyGrayscaleLsbBuffers();
+      else
+        renderer.copyGrayscaleMsbBuffers();
+    }
+    if (activityManager.isSwitchPending()) return false;
+    renderer.displayGrayBuffer();
+    committed = renderer.displayCommitted();
+    return committed;
+  }
+
+  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft,
+                              int pageNumber = -1) const;
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
   void applyInitialOrientation() override;

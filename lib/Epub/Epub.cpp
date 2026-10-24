@@ -10,6 +10,8 @@
 #include <Utf8.h>
 #include <ZipFile.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -749,6 +751,45 @@ bool Epub::loadMetadata(std::string& title, std::string& author) {
   return true;
 }
 
+bool Epub::loadSyncMetadata(SyncMetadata& metadata) {
+  metadata = {};
+
+  ZipFile zip(filepath);
+  if (!zip.open()) {
+    LOG_DBG("EBP", "Could not open ePub for sync metadata: %s", filepath.c_str());
+    return false;
+  }
+
+  std::string contentOpfFilePath;
+  if (!findContentOpfFile(&contentOpfFilePath, &zip)) {
+    zip.close();
+    return false;
+  }
+
+  size_t contentOpfSize;
+  if (!zip.getInflatedFileSize(contentOpfFilePath.c_str(), &contentOpfSize)) {
+    zip.close();
+    return false;
+  }
+
+  const std::string basePath = contentOpfFilePath.substr(0, contentOpfFilePath.find_last_of('/') + 1);
+  ContentOpfParser parser(cachePath, basePath, contentOpfSize, nullptr, true);
+  if (!parser.setup()) {
+    zip.close();
+    return false;
+  }
+
+  const bool read = zip.readFileToStream(contentOpfFilePath.c_str(), parser, 1024, true);
+  zip.close();
+  if (!read) return false;
+
+  metadata.isbn = std::move(parser.isbn);
+  metadata.asin = std::move(parser.asin);
+  metadata.series = std::move(parser.series);
+  metadata.seriesIndex = parser.seriesIndex;
+  return true;
+}
+
 bool Epub::clearCache() const {
   if (!Storage.exists(cachePath.c_str())) {
     LOG_DBG("EPB", "Cache does not exist, no action needed");
@@ -1061,6 +1102,56 @@ int Epub::getSpineItemsCount() const {
   return bookMetadataCache->getSpineCount();
 }
 
+bool Epub::isLinearSpineItem(const int spineIndex) const {
+  if (spineIndex < 0 || spineIndex >= getSpineItemsCount()) return false;
+  bool linear = true;
+  if (bookMetadataCache->getLinear(spineIndex, linear)) return linear;
+  const auto entry = getSpineItem(spineIndex);
+  return !entry.href.empty() && entry.linear;
+}
+
+int Epub::getLinearSpineItemsCount() const {
+  int count = 0;
+  for (int i = 0; i < getSpineItemsCount(); ++i) {
+    if (isLinearSpineItem(i)) ++count;
+  }
+  return count;
+}
+
+int Epub::getSpineIndexForLinearIndex(const int linearIndex) const {
+  if (linearIndex < 0) return -1;
+  int ordinal = 0;
+  for (int i = 0; i < getSpineItemsCount(); ++i) {
+    if (isLinearSpineItem(i) && ordinal++ == linearIndex) return i;
+  }
+  return -1;
+}
+
+int Epub::getLinearIndexForSpineIndex(const int spineIndex) const {
+  if (!isLinearSpineItem(spineIndex)) return -1;
+  int ordinal = 0;
+  for (int i = 0; i < spineIndex; ++i) {
+    if (isLinearSpineItem(i)) ++ordinal;
+  }
+  return ordinal;
+}
+
+int Epub::getNextLinearSpineIndex(const int spineIndex) const {
+  if (spineIndex < -1 || spineIndex >= getSpineItemsCount()) return -1;
+  for (int i = spineIndex + 1; i < getSpineItemsCount(); ++i) {
+    if (isLinearSpineItem(i)) return i;
+  }
+  return -1;
+}
+
+int Epub::getPreviousLinearSpineIndex(const int spineIndex) const {
+  if (spineIndex < 0 || spineIndex > getSpineItemsCount()) return -1;
+  for (int i = spineIndex - 1; i >= 0; --i) {
+    if (isLinearSpineItem(i)) return i;
+  }
+  return -1;
+}
+
 size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     return 0;
@@ -1139,7 +1230,7 @@ size_t Epub::getBookSize() const {
 int Epub::getSpineIndexForTextReference() const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     LOG_ERR("EBP", "getSpineIndexForTextReference called but cache not loaded");
-    return 0;
+    return -1;
   }
   LOG_DBG("EBP", "Core Metadata: cover(%d)=%s, textReference(%d)=%s",
           bookMetadataCache->coreMetadata.coverItemHref.size(), bookMetadataCache->coreMetadata.coverItemHref.c_str(),
@@ -1147,13 +1238,13 @@ int Epub::getSpineIndexForTextReference() const {
           bookMetadataCache->coreMetadata.textReferenceHref.c_str());
 
   if (bookMetadataCache->coreMetadata.textReferenceHref.empty()) {
-    // there was no textReference in epub, so we return 0 (the first chapter)
-    return 0;
+    return getNextLinearSpineIndex(-1);
   }
 
   // loop through spine items to get the correct index matching the text href
   for (size_t i = 0; i < getSpineItemsCount(); i++) {
-    if (getSpineItem(i).href == bookMetadataCache->coreMetadata.textReferenceHref) {
+    const auto item = getSpineItem(i);
+    if (item.linear && item.href == bookMetadataCache->coreMetadata.textReferenceHref) {
       LOG_DBG("EBP", "Text reference %s found at index %d", bookMetadataCache->coreMetadata.textReferenceHref.c_str(),
               i);
       return i;
@@ -1161,7 +1252,7 @@ int Epub::getSpineIndexForTextReference() const {
   }
   // This should not happen, as we checked for empty textReferenceHref earlier
   LOG_DBG("EBP", "Section not found for text reference");
-  return 0;
+  return getNextLinearSpineIndex(-1);
 }
 
 // Calculate progress in book (returns 0.0-1.0)
@@ -1175,6 +1266,24 @@ float Epub::calculateProgress(const int currentSpineIndex, const float currentSp
   const float sectionProgSize = currentSpineRead * static_cast<float>(curChapterSize);
   const float totalProgress = static_cast<float>(prevChapterSize) + sectionProgSize;
   return totalProgress / static_cast<float>(bookSize);
+}
+
+bool Epub::findSpineForProgress(float fraction, int& spineIndex, float& chapterFraction) const {
+  const size_t bookSize = getBookSize();
+  if (bookSize == 0 || !std::isfinite(fraction)) return false;
+  fraction = std::clamp(fraction, 0.0f, 1.0f);
+  const size_t target = fraction == 1.0f ? bookSize - 1 : static_cast<size_t>(bookSize * double(fraction));
+  size_t previous = 0;
+  for (int i = 0; i < getSpineItemsCount(); ++i) {
+    const size_t cumulative = getCumulativeSpineItemSize(i);
+    if (isLinearSpineItem(i) && cumulative > previous && target < cumulative) {
+      spineIndex = i;
+      chapterFraction = fraction == 1.0f ? 1.0f : static_cast<float>(target - previous) / (cumulative - previous);
+      return true;
+    }
+    previous = cumulative;
+  }
+  return false;
 }
 
 int Epub::resolveHrefToSpineIndex(const std::string& href) const {

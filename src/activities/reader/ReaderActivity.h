@@ -20,7 +20,11 @@ class ReaderActivity : public Activity {
   ReaderSession readerSession;
   std::atomic<bool> pageRendered{false};
   bool bookRemembered = false;
-  void markPageRendered() { pageRendered.store(true, std::memory_order_release); }
+  bool renderCommitted = false;
+  void markPageRendered() {
+    renderCommitted = true;
+    pageRendered.store(true, std::memory_order_release);
+  }
   void rememberBookOnceRendered();
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -50,6 +54,20 @@ class ReaderActivity : public Activity {
   virtual bool skipPages(int amount) { return pageTurn(amount > 0); }
   virtual bool isAtEndOfBook() const = 0;
   virtual void onReturnFromEndOfBook() {}
+
+  // Tap-zone action dispatch. The base implementation handles the actions that
+  // every reader shares (orientation, frontlight, home); subclasses extend it
+  // with reader-specific actions (bookmark / dictionary / chapter / percent /
+  // KOReader / auto turn). Returning false leaves the action unhandled, which
+  // the loop treats as "not supported on this reader" and swallows.
+  virtual bool handleZoneShortAction(uint8_t action);
+  virtual bool handleZoneLongAction(uint8_t action);
+
+  // Rotate the reading orientation by +1 (clockwise) / -1 (counter-clockwise)
+  // and toggle the frontlight. Shared by all readers; orientation reflows are
+  // handled by each reader's own rendering pass on the next update.
+  void rotateOrientation(int delta);
+  void toggleFrontlight();
 
   virtual void renderBook() = 0;
   virtual void applyInitialOrientation();

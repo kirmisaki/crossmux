@@ -243,7 +243,7 @@ bool buildDictionaryHtmlPages(GfxRenderer& renderer, const std::string& definiti
     // handling, the only path that dereferences it.
     auto parser = makeUniqueNoThrow<ChapterHtmlSlimParser>(
         nullptr, tmpPath, renderer, SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-        SETTINGS.extraParagraphSpacing, SETTINGS.firstLineIndent, SETTINGS.paragraphAlignment, viewportWidth,
+        SETTINGS.extraParagraphSpacing, SETTINGS.firstLineIndent, SETTINGS.paragraphAlignment, false, viewportWidth,
         viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.focusReadingEnabled,
         [&pagesOut, &resourceLimitHit, &retainedElements, &limitReason](std::unique_ptr<Page> page, uint16_t, uint16_t,
                                                                         uint32_t) {
@@ -286,6 +286,11 @@ bool buildDictionaryHtmlPages(GfxRenderer& renderer, const std::string& definiti
     LOG_ERR("DHTML", "Styled definition exceeded page heap budget");
   }
   if (!ok || resourceLimitHit || pagesOut.empty()) {
+    if (!ok) {
+      LOG_ERR("DHTML", "Definition parse/layout failed");
+    } else if (!resourceLimitHit && pagesOut.empty()) {
+      LOG_ERR("DHTML", "Definition produced no styled pages");
+    }
     pagesOut.clear();
     return false;
   }
